@@ -1,0 +1,10 @@
+.env
+app/rag/chroma_db/
+app/rag/models/
+__pycache__/
+*.pyc
+data/
+weights/*.pt
+*.pt
+*.log
+server_log.txt

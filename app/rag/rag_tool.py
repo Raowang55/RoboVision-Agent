@@ -1,7 +1,8 @@
+# -*- coding: utf-8 -*-
 """RAG tool: unified entry point for knowledge-base Q&A.
 
 Orchestrates document loading, vector search, prompt building,
-and Qwen3-VL API calls with fallback.
+and Gemma API calls with fallback.
 """
 
 from pathlib import Path
@@ -36,13 +37,13 @@ def rag_query(
     use_llm: bool = True,
     history: list[dict] | None = None,
 ) -> dict:
-    """Run a RAG query: retrieve relevant chunks, then optionally call Qwen3-VL.
+    """Run a RAG query: retrieve relevant chunks, then optionally call Gemma.
 
     Args:
         question:    The user's question.
         top_k:       Number of chunks to retrieve.
         log_context: Optional event log summary dict.
-        use_llm:     Whether to call Qwen3-VL API (True) or just return chunks (False).
+        use_llm:     Whether to call Gemma API (True) or just return chunks (False).
 
     Returns:
         dict with:
@@ -53,8 +54,8 @@ def rag_query(
             - used_llm:         bool
             - model:            str | None
     """
+    from app.rag.prompt_builder import build_fallback_answer, build_rag_prompt
     from app.rag.vector_store import search
-    from app.rag.prompt_builder import build_rag_prompt, build_fallback_answer
 
     # ---- Step 1: retrieve relevant chunks ----
     retrieved = search(question, top_k=top_k)
@@ -68,7 +69,7 @@ def rag_query(
     model = None
 
     if use_llm and retrieved:
-        from app.llm.deepseek_client import chat, DEEPSEEK_MODEL
+        from app.llm.llm_client import chat
 
         # Build messages with optional conversation history
         if history:
@@ -106,7 +107,7 @@ def rag_query(
         else:
             # LLM failed, fallback to retrieval-only
             answer = (
-                f"*Qwen3-VL API 调用失败: {llm_result['error']}*\n\n"
+                f"*LLM API 调用失败：{llm_result['error']}*\n\n"
                 + build_fallback_answer(question, retrieved, log_context)
             )
     else:

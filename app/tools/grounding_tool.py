@@ -1,59 +1,72 @@
-"""Grounding DINO open-vocabulary detection tool (mock implementation)."""
+"""Real YOLO-World open-vocabulary detection tool."""
 
-import time
-import random
+from __future__ import annotations
+
+import re
 from typing import Any
 
 import numpy as np
+
+from app.config import GROUNDING_BOX_THRESHOLD
+
+
+def _parse_classes(text_prompt: str, classes: list[str] | None = None) -> list[str]:
+    if classes:
+        return [str(item).strip() for item in classes if str(item).strip()]
+    cleaned = re.sub(
+        r"^(detect|find|identify|检测|查找|识别)\s*",
+        "",
+        (text_prompt or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    parsed = [item.strip() for item in re.split(r"[,，、;；\n]+", cleaned) if item.strip()]
+    return parsed or ["person"]
 
 
 def detect_open(
     image: np.ndarray,
     text_prompt: str,
-    box_threshold: float = 0.35,
+    box_threshold: float = GROUNDING_BOX_THRESHOLD,
     text_threshold: float = 0.25,
+    classes: list[str] | None = None,
     **kwargs: Any,
 ) -> dict:
-    """Mock open-vocabulary detection. Accepts a free-form text prompt.
+    """Detect user-supplied classes using the configured YOLO-World model."""
+    del text_threshold, kwargs
+    if image is None or not isinstance(image, np.ndarray):
+        raise ValueError("detect_open requires a numpy image")
 
-    Args:
-        image: Input image as a numpy array (H, W, C).
-        text_prompt: Natural-language description of objects to find.
-        box_threshold: Confidence threshold for bounding boxes.
-        text_threshold: Confidence threshold for text-to-region matching.
+    from app.runtime.unified_pipeline import _get_world_model
 
-    Returns:
-        dict with keys:
-            - phrases: list of matched text phrases.
-            - boxes: list of [x1, y1, x2, y2] bounding boxes (0-1).
-            - scores: list of confidence scores.
-            - prompt: the original text prompt.
-    """
-    time.sleep(random.uniform(0.5, 1.2))
-
-    # Parse prompt into loose keywords
-    keywords = [w.strip().rstrip("s") for w in text_prompt.replace(",", " ").split() if len(w) > 2]
-    if not keywords:
-        keywords = ["object"]
-
-    h, w = image.shape[:2]
-    num = random.randint(1, min(3, len(keywords)))
-    picked = random.sample(keywords, k=num)
-
-    boxes, phrases, scores = [], [], []
-    for phrase in picked:
-        cx, cy = random.uniform(0.2, 0.8), random.uniform(0.2, 0.8)
-        bw, bh = random.uniform(0.08, 0.25), random.uniform(0.08, 0.25)
-        x1, y1 = max(0, cx - bw / 2), max(0, cy - bh / 2)
-        x2, y2 = min(1, cx + bw / 2), min(1, cy + bh / 2)
-        boxes.append([round(x1, 3), round(y1, 3), round(x2, 3), round(y2, 3)])
-        phrases.append(phrase)
-        scores.append(round(random.uniform(0.65, 0.95), 2))
+    class_names = _parse_classes(text_prompt, classes)
+    model, _ = _get_world_model()
+    model.set_classes(class_names)
+    result = model.predict(source=image, conf=float(box_threshold), verbose=False)[0]
+    height, width = image.shape[:2]
+    boxes: list[list[float]] = []
+    phrases: list[str] = []
+    scores: list[float] = []
+    if result.boxes is not None:
+        for box in result.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            class_id = int(box.cls[0].item())
+            boxes.append(
+                [
+                    round(x1 / width, 4),
+                    round(y1 / height, 4),
+                    round(x2 / width, 4),
+                    round(y2 / height, 4),
+                ]
+            )
+            phrases.append(str(result.names[class_id]))
+            scores.append(round(float(box.conf[0].item()), 4))
 
     return {
-        "tool": "grounding_detect",
+        "tool": "yolo_world_open_vocabulary",
         "phrases": phrases,
         "boxes": boxes,
         "scores": scores,
         "prompt": text_prompt,
+        "classes": class_names,
+        "message": f"Detected {len(boxes)} open-vocabulary object(s).",
     }

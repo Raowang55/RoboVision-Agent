@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Structured logging configuration for RoboVision-Agent.
 
 Provides a single ``setup_logging()`` call that configures:

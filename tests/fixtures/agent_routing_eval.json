@@ -1,0 +1,164 @@
+[
+  {
+    "id": "detect_en",
+    "query": "detect all objects in this image",
+    "expected_intent": "detect",
+    "expected_tools": [
+      "detect"
+    ]
+  },
+  {
+    "id": "yolo_en",
+    "query": "run yolo inference on this photo",
+    "expected_intent": "detect",
+    "expected_tools": [
+      "detect"
+    ]
+  },
+  {
+    "id": "detect_zh",
+    "query": "识别图片中的人员",
+    "expected_intent": "detect",
+    "expected_tools": [
+      "detect"
+    ]
+  },
+  {
+    "id": "open_en",
+    "query": "open vocabulary detection for helmet",
+    "expected_intent": "detect_open",
+    "expected_tools": [
+      "detect_open"
+    ]
+  },
+  {
+    "id": "open_zh",
+    "query": "使用自定义类别检测安全锥",
+    "expected_intent": "detect_open",
+    "expected_tools": [
+      "detect_open"
+    ]
+  },
+  {
+    "id": "rag_en",
+    "query": "what safety regulation applies here",
+    "expected_intent": "rag",
+    "expected_tools": [
+      "rag"
+    ]
+  },
+  {
+    "id": "rag_how",
+    "query": "how to handle a smoke alarm",
+    "expected_intent": "rag",
+    "expected_tools": [
+      "rag"
+    ]
+  },
+  {
+    "id": "rag_zh",
+    "query": "有什么安全规定",
+    "expected_intent": "rag",
+    "expected_tools": [
+      "rag"
+    ]
+  },
+  {
+    "id": "event_en",
+    "query": "show me the event log",
+    "expected_intent": "event_log",
+    "expected_tools": [
+      "event_log"
+    ]
+  },
+  {
+    "id": "event_zh",
+    "query": "查看日志",
+    "expected_intent": "event_log",
+    "expected_tools": [
+      "event_log"
+    ]
+  },
+  {
+    "id": "fire_log_en",
+    "query": "show the fire alarm log",
+    "expected_intent": "fire_log",
+    "expected_tools": [
+      "fire_log"
+    ]
+  },
+  {
+    "id": "fire_log_zh",
+    "query": "查询火警记录",
+    "expected_intent": "fire_log",
+    "expected_tools": [
+      "fire_log"
+    ]
+  },
+  {
+    "id": "report_en",
+    "query": "generate an inspection report",
+    "expected_intent": "inspection_report",
+    "expected_tools": [
+      "inspection_report"
+    ]
+  },
+  {
+    "id": "report_zh",
+    "query": "生成巡检报告",
+    "expected_intent": "inspection_report",
+    "expected_tools": [
+      "inspection_report"
+    ]
+  },
+  {
+    "id": "disposal_en",
+    "query": "create a disposal work order",
+    "expected_intent": "disposal",
+    "expected_tools": [
+      "disposal"
+    ]
+  },
+  {
+    "id": "disposal_zh",
+    "query": "执行事件处置",
+    "expected_intent": "disposal",
+    "expected_tools": [
+      "disposal"
+    ]
+  },
+  {
+    "id": "chain_en",
+    "query": "detect objects and then query safety regulations",
+    "expected_intent": "chain",
+    "expected_tools": [
+      "detect",
+      "rag"
+    ]
+  },
+  {
+    "id": "chain_zh",
+    "query": "检测人员然后查询安全规范",
+    "expected_intent": "chain",
+    "expected_tools": [
+      "detect",
+      "rag"
+    ]
+  },
+  {
+    "id": "empty",
+    "query": "",
+    "expected_intent": "detect",
+    "expected_tools": [
+      "detect"
+    ]
+  },
+  {
+    "id": "fallback",
+    "query": "process this image",
+    "expected_intent": "detect",
+    "expected_tools": [
+      "detect"
+    ]
+  }
+]

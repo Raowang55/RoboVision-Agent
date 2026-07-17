@@ -1,5 +1,8 @@
+# -*- coding: utf-8 -*-
 """Tests for FireAlarmEngine rule logic."""
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app.runtime.fire_alarm_rules import FireAlarmEngine
@@ -30,6 +33,28 @@ def test_medium_alarm_after_10_smoke_frames():
     result = engine.update([_det("smoke", conf=0.5)])
     assert result is not None
     assert result["alarm_level"] == "MEDIUM"
+
+
+def test_medium_alarm_with_smoke_window_tolerance():
+    engine = FireAlarmEngine(cooldown_seconds=0)
+    sequence = [
+        [_det("smoke", conf=0.5)],
+        [],
+        [_det("smoke", conf=0.5)],
+        [_det("smoke", conf=0.5)],
+        [_det("smoke", conf=0.5)],
+        [],
+        [_det("smoke", conf=0.5)],
+        [_det("smoke", conf=0.5)],
+        [_det("smoke", conf=0.5)],
+    ]
+    for detections in sequence:
+        assert engine.update(detections) is None
+
+    result = engine.update([_det("smoke", conf=0.5)])
+    assert result is not None
+    assert result["alarm_level"] == "MEDIUM"
+    assert result["event_type"] == "smoke"
 
 
 def test_cooldown_suppresses_repeat():

@@ -1,941 +1,457 @@
-"""Agent scheduler -- routes user requests to the right tools.
+"""RoboVision's small, observable multi-tool agent orchestrator.
 
-Supports single-tool dispatch and multi-step chain: detect -> RAG.
+Routing is deterministic by default so the application works without an LLM.
+An OpenAI-compatible model can optionally parse ambiguous requests, while the
+actual tool execution and the detect-to-RAG chain remain explicit and testable.
 """
+
+from __future__ import annotations
 
 import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
 
-from app.tools import (
-    detect_open, segment, analyze,
-    generate_report, deploy, query_log,
-    query_fire_log, build_markdown_summary,
-    query_event_log, build_summary_markdown,
-    generate_inspection_report,
-)
-from app.rag.rag_tool import rag_query
-from app.utils.file_utils import get_output_path
+from app.config import DEFAULT_CONFIDENCE, GROUNDING_BOX_THRESHOLD, LLM_ENABLED
+from app.contracts import AgentResponse, ToolResult, tool_error, tool_success
+from app.utils.agent_utils import build_summary_lines as _summary_lines
+from app.utils.agent_utils import save_numpy_as_rgb
 
+Media = str | Path | np.ndarray | int | None
+ToolHandler = Callable[[Media, str, dict[str, Any]], tuple[ToolResult, np.ndarray | None]]
 
-# Map of command keywords to (tool function, description)
-TOOL_REGISTRY = {
-    "detect_open": (detect_open, "Find objects by text description (open vocabulary)"),
-    "segment": (segment, "Segment objects with SAM"),
-    "analyze": (analyze, "Analyze dataset statistics"),
-    "report": (generate_report, "Generate a visual report"),
-    "deploy": (deploy, "Export model to ONNX / TensorRT"),
-    "log": (query_log, "Analyze detection logs"),
-    "fire_log": (query_fire_log, "Analyze fire alarm logs"),
-    "event_log": (query_event_log, "Analyze unified event log"),
-    "inspection_report": (generate_inspection_report, "Generate inspection report and save to file"),
-    "rag": (rag_query, "RAG knowledge base Q&A with Qwen3-VL"),
-}
-
-# ---------------------------------------------------------------------------
-# chain detection -- multi-step: detect -> RAG
-# ---------------------------------------------------------------------------
-
-# Connector words that signal a multi-step request
-CHAIN_CONNECTORS = ("?", "??", "??", "??", "?", "??", "??", "and", "then")
-
-# Keywords that suggest the FIRST step is detection
-CHAIN_DETECT_KEYWORDS = (
-    "??", "??", "??", "detect", "find", "identify",
-    "??", "??", "??", "??", "??",
-)
-
-# Keywords that suggest the SECOND step is RAG / knowledge query
+CHAIN_CONNECTORS = ("并", "然后", "接着", "随后", "and", "then")
+CHAIN_DETECT_KEYWORDS = ("检测", "识别", "查找", "发现", "detect", "find", "identify")
 CHAIN_RAG_KEYWORDS = (
-    "??", "??", "??", "??", "??", "??", "??",
-    "????", "????", "????", "???",
-    "??", "??", "??", "??",
-    "regulation", "standard", "guideline", "safety",
+    "规范",
+    "标准",
+    "指南",
+    "规定",
+    "安全",
+    "如何处理",
+    "处置",
+    "regulation",
+    "standard",
+    "guideline",
+    "safety",
 )
 
 
 def _is_chain_query(text: str) -> bool:
-    """Return True if *text* looks like a multi-step detect-then-RAG request."""
-    text_lower = text.lower()
+    """Return whether a request explicitly asks for detection then knowledge."""
+    lowered = (text or "").lower()
+    return (
+        any(word in lowered for word in CHAIN_CONNECTORS)
+        and any(word in lowered for word in CHAIN_DETECT_KEYWORDS)
+        and any(word in lowered for word in CHAIN_RAG_KEYWORDS)
+    )
 
-    # Must contain a connector
-    has_connector = any(c in text_lower for c in CHAIN_CONNECTORS)
-    if not has_connector:
-        return False
-
-    # Must contain at least one detect keyword AND one RAG keyword
-    has_detect = any(w in text_lower for w in CHAIN_DETECT_KEYWORDS)
-    has_rag = any(w in text_lower for w in CHAIN_RAG_KEYWORDS)
-
-    return has_detect and has_rag
-
-
-# ---------------------------------------------------------------------------
-# intent parser (keyword-based)
-# ---------------------------------------------------------------------------
 
 def parse_intent(text: str) -> str:
-    """Naive intent parser -- looks for tool keywords in the user's message."""
-    text_lower = text.lower()
-
-    # Priority 0: multi-step chain (detect + RAG)
-    if _is_chain_query(text_lower):
+    """Fast offline intent parser used as the reliable default planner."""
+    lowered = (text or "").strip().lower()
+    if _is_chain_query(lowered):
         return "chain"
-
-    # Priority 1: explicit open-vocabulary keywords
-    if any(w in text_lower for w in ("open vocabulary", "grounding", "detect_open")):
+    if any(word in lowered for word in ("open vocabulary", "开放词汇", "自定义类别", "detect_open")):
         return "detect_open"
-
-    # Priority 2: segmentation
-    if any(w in text_lower for w in ("segment", "mask", "sam")):
-        return "segment"
-
-    # Priority 3: dataset analysis
-    if any(w in text_lower for w in ("analyze", "dataset", "statistics", "stats")):
-        return "analyze"
-
-    # Priority 4: report / visual report
-    if any(w in text_lower for w in ("report", "visualize")):
-        return "report"
-
-    # Priority 5.5: RAG knowledge base Q&A (direct questions)
-    if any(w in text_lower for w in (
-        "???", "????", "????", "??",
-        "??", "??", "???", "??",
-        "??", "??", "??", "??",
-    )):
-        return "rag"
-
-    if any(w in text_lower for w in ("deploy", "export", "onnx", "tensorrt")):
-        return "deploy"
-
-    # Priority 6: inspection report (report generation keywords)
-    if any(w in text_lower for w in ("????", "????", "??", "??", "summary")):
+    if any(word in lowered for word in ("巡检报告", "生成报告", "inspection report", "summary report")):
         return "inspection_report"
-
-    # Priority 7: unified event log -- Chinese keywords (??/??/??/??/????/??)
-    if any(w in text_lower for w in ("??", "??", "??", "??", "????", "??")):
+    if any(word in lowered for word in ("事件处置", "处置工单", "disposal", "work order")):
+        return "disposal"
+    if any(
+        word in lowered
+        for word in ("event_log", "event log", "事件日志", "查看日志", "查询事件", "报警记录")
+    ):
         return "event_log"
-
-    # Priority 8: fire alarm log (specific fire/smoke queries)
-    if any(w in text_lower for w in ("fire", "smoke")):
+    if any(word in lowered for word in ("fire log", "fire alarm log", "火灾日志", "火警记录")):
         return "fire_log"
-
-    # Priority 9: unified event log (general English keywords)
-    if any(w in text_lower for w in ("log", "event_log")):
+    if any(word in lowered for word in ("日志", "log history", "alarm log history")):
         return "event_log"
-
-    # Priority 10: legacy keywords -> event_log for backward compat
-    if any(w in text_lower for w in ("alarm",)):
-        return "event_log"
-
-    # Priority 11: YOLO detection (default for common vision keywords)
-    if any(w in text_lower for w in (
-        "detect", "yolo", "object", "objects",
-        "find", "identify",
-        "people", "person", "persons",
-        "vehicle", "vehicles", "car", "cars",
-        "truck", "trucks", "bus", "buses",
-    )):
-        return "detect"
-
-    # Default: YOLO detection
+    if any(
+        word in lowered
+        for word in (
+            "规范",
+            "标准",
+            "规定",
+            "指南",
+            "手册",
+            "安全要求",
+            "如何",
+            "怎么",
+            "为什么",
+            "regulation",
+            "standard",
+            "guideline",
+            "what safety",
+            "how to",
+        )
+    ):
+        return "rag"
+    if any(word in lowered for word in ("火灾", "火焰", "烟雾", "火警", "fire", "smoke")):
+        return "fire_log"
     return "detect"
 
 
-# ---------------------------------------------------------------------------
-# LLM intent router
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = (
-    "??????AI Agent???????\n"
-    "?????JSON??????????????????????\n"
-    "\n"
-    "??intent?????\n"
-    "- detect: ????????????????\n"
-    "- chain: ????????????????????\n"
-    "  ????????\"?\"?\"??\"?\"??\"?\"??\"?????\n"
-    "   ????????????????\n"
-    "- rag: ??????????????\n"
-    "- inspection_report: ??????\n"
-    "- event_log: ??????\n"
-    "- fire_log: ????????\n"
-    "- deploy: ????????\n"
-    "\n"
-    "??task_subtype??fire | ppe | general\n"
-    "\n"
-    "chain?????\n"
-    '- \"??????????\" ??chain\n'
-    '- \"????????????????????\" ??chain\n'
-    '- \"???????????????????\" ??chain\n'
-    "\n"
-    "?????\n"
-    "{\n"
-    '  "intent": "string",\n'
-    '  "confidence": 0.0-1.0,\n'
-    '  "params": {\n'
-    '    "need_rag": true/false,\n'
-    '    "media_type": "image/video/text",\n'
-    '    "task_subtype": "fire/ppe/general"\n'
-    "  }\n"
-    "}"
-)
-
-
-def parse_intent_with_llm(text_prompt: str) -> dict:
-    """Use Qwen3-VL LLM to parse user intent from natural language.
-
-    Returns a dict with intent, confidence, and params.
-    Falls back to keyword-based parse_intent() on failure.
-
-    Args:
-        text_prompt: The user's raw input text.
-
-    Returns:
-        dict: {"intent": str, "confidence": float, "params": {...}}
-    """
-    try:
-        from app.llm.deepseek_client import chat
-
-        messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": text_prompt},
-        ]
-
-        llm_result = chat(messages, temperature=0.0, max_tokens=300)
-
-        if not llm_result.get("success"):
-            raise ValueError(f"LLM call failed: {llm_result.get('error')}")
-
-        raw = llm_result["content"]
-
-        # ---- Clean JSON: remove markdown fences and surrounding noise ----
-        # Strip ```json ... ``` wrappers
-        cleaned = re.sub(r"```(?:json)?\s*", "", raw)
-        cleaned = re.sub(r"```", "", cleaned)
-        # Strip any text before the first { and after the last }
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end == -1:
-            raise ValueError(f"No JSON object found in LLM response: {raw}")
-        cleaned = cleaned[start:end + 1]
-
-        parsed = json.loads(cleaned)
-
-        intent = parsed.get("intent", "")
-        confidence = float(parsed.get("confidence", 0))
-
-        # Validate intent value
-        valid_intents = {
-            "detect", "rag", "chain", "inspection_report",
-            "event_log", "fire_log", "deploy",
-        }
-        if intent not in valid_intents:
-            raise ValueError(f"Unknown intent: {intent}")
-
-        # ---- Fallback if confidence too low ----
-        if confidence < 0.5:
-            raise ValueError(f"Low confidence: {confidence}")
-
-        return {
-            "intent": intent,
-            "confidence": confidence,
-            "params": parsed.get("params", {}),
-            "source": "llm",
-        }
-
-    except Exception:
-        # Fallback to keyword-based parser
-        keyword_intent = parse_intent(text_prompt)
-        return {
-            "intent": keyword_intent,
-            "confidence": 0.0,
-            "params": {},
-            "source": "keyword_fallback",
-        }
-
-
-# ---------------------------------------------------------------------------
-# image helpers
-# ---------------------------------------------------------------------------
-
-def _save_numpy_as_rgb(image: np.ndarray) -> str:
-    """Save a Gradio RGB numpy image to a temp file and return the path."""
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    out_dir = "data/outputs"
-    path = get_output_path(prefix=f"input_{ts}", ext=".jpg", directory=out_dir)
-    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(str(path), bgr)
-    return str(path)
-
-
-# ---------------------------------------------------------------------------
-# multi-step chain: detect -> RAG
-# ---------------------------------------------------------------------------
-
-def _run_chain(
-    image: np.ndarray | None,
-    text_prompt: str,
-    **kwargs: Any,
-) -> tuple[dict, np.ndarray | None]:
-    """Execute detect then RAG query in sequence.
-
-    Steps:
-        1. Run YOLO detection on the image.
-        2. Extract unique detected class names.
-        3. Build a RAG query: "[class_names] ???????"
-        4. Call rag_query with the constructed question.
-        5. Return merged result.
-
-    Returns:
-        (result_dict, annotated_image_array)
-    """
-    trace = []
-
-    # ---- Step 1: detect ----
-    if image is None:
-        return {
-            "answer": "??????????????????????",
-            "detections": [],
-            "rag_answer": None,
-            "used_chain": True,
-            "decision_trace": ["chain: no image provided -> abort"],
-        }, None
-
-    temp_path = _save_numpy_as_rgb(image)
-    trace.append(f"detect(image={Path(temp_path).name})")
-
-    detect_result = detect(image_path=temp_path, conf=kwargs.get("conf", 0.25))
-    detections = detect_result.get("detections", [])
-    trace.append(f"detect -> {len(detections)} objects found")
-
-    # ---- Step 2: extract unique class names ----
-    class_names = list({d["class_name"] for d in detections})
-    if not class_names:
-        return {
-            "answer": "???????????????????????????",
-            "detections": detections,
-            "rag_answer": None,
-            "used_chain": True,
-            "decision_trace": trace,
-        }, _read_annotated_image(detect_result)
-
-    trace.append(f"classes: {class_names}")
-
-    # ---- Step 3: build RAG question ----
-    # Translate common English class names to Chinese for better RAG retrieval
-    _class_translation = {
-        "person": "??", "car": "??", "truck": "??",
-        "bus": "??", "bicycle": "???", "motorcycle": "???",
-        "fire": "??", "smoke": "??",
-        "helmet": "???", "vest": "???",
-    }
-    chinese_names = [_class_translation.get(cn, cn) for cn in class_names]
-    names_str = "?".join(chinese_names)
-
-    question = f"??? {names_str}????????????????"
-    trace.append(f"rag_query(question={question!r})")
-
-    # ---- Step 4: RAG query ----
-    rag_result = rag_query(question=question)
-    trace.append(f"rag -> used_llm={rag_result.get('used_llm')}, model={rag_result.get('model')}")
-
-    # ---- Step 5: merge ----
-    answer_parts = [
-        f"**????**??? {len(detections)} ?????? {len(class_names)} ??{names_str}?",
-        "",
-        f"**????**?{rag_result.get('answer', '????????')}",
-    ]
-
-    if rag_result.get("source_files"):
-        answer_parts.append("")
-        answer_parts.append("**????**?")
-        for src in rag_result["source_files"]:
-            answer_parts.append(f"  - `{src}`")
-
-    merged = {
-        "answer": "\n".join(answer_parts),
-        "detections": detections,
-        "rag_answer": rag_result.get("answer"),
-        "rag_source_files": rag_result.get("source_files", []),
-        "rag_used_llm": rag_result.get("used_llm", False),
-        "rag_model": rag_result.get("model"),
-        "used_chain": True,
-        "decision_trace": trace,
-    }
-
-    # Read annotated image from detect
-    annotated = _read_annotated_image(detect_result)
-
-    return merged, annotated
-
-
-def _read_annotated_image(detect_result: dict) -> np.ndarray | None:
-    """Read the output_image from a detect result as RGB numpy array."""
-    out_img = detect_result.get("output_image")
-    if out_img and Path(out_img).exists():
-        img = cv2.imread(out_img)
-        if img is not None:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return None
-
-
-
-# ---------------------------------------------------------------------------
-# ReAct loop -- lightweight agentic reasoning
-# ---------------------------------------------------------------------------
-
-# Keywords that trigger the ReAct path (more complex reasoning needed)
-_REACT_KEYWORDS = (
-    "分析", "评估", "为什么", "怎么办", "接着", "然后", "原因",
-    "analyze", "assess", "why", "how", "then", "next",
-)
-
-
-_REACT_SYSTEM_PROMPT = """You are an industrial vision AI agent. You have access to these tools:
-
-- detect: Run YOLO object detection on an image. Params: {"conf": float} (optional, default 0.25)
-- rag: Query the safety knowledge base. Params: {"question": "string"} (required)
-- event_log: Query unified event/detection logs and statistics. Params: {} (none)
-- fire_log: Query fire alarm log. Params: {} (none)
-- inspection_report: Generate an inspection report from logs. Params: {} (none)
-- finish: Return the final answer and stop. Params: {"answer": "string"} (required)
-
-You MUST respond in exactly this format each round:
-思考：<1-2 sentences describing your reasoning and next step, in Chinese>
-行动：valid JSON object with "tool" and "params" keys>
-
-Example:
-思考：用户的问题涉及安全规范，我需要先查询知识库。
-行动：{"tool": "rag", "params": {"question": "安全帽的佩戴规范是什么？"}}
-
-When you have enough information to answer the user, call finish:
-思考：我已经获得足够的信息，可以给出最终回答。
-行动：{"tool": "finish", "params": {"answer": "根据知识库.."}}
-
-Important rules:
-- Output ONLY one "思考：" and one "行动： per round, nothing else.
-- The "行动： must be a single line of valid JSON.
-- Never make up information. If you don't know, say so.
+_PLANNER_PROMPT = """You route requests for an industrial safety application.
+Return only one JSON object with keys intent, confidence, params.
+Valid intents: detect, detect_open, rag, chain, event_log, fire_log,
+inspection_report, disposal. Do not invent another intent.
 """
 
 
-def _parse_react_output(text: str):
-    """Parse LLM ReAct output: extract '思考：' and '行动： sections.
+def parse_intent_with_llm(text_prompt: str, use_llm: bool | None = None) -> dict[str, Any]:
+    """Optionally use an LLM planner, then fall back immediately to rules."""
+    enabled = LLM_ENABLED if use_llm is None else use_llm
+    if enabled:
+        try:
+            from app.llm.llm_client import chat
 
-    Returns (thought, action_dict, error).
-    """
-    # Extract thought
-    thought_match = re.search(r"思考[：]\s*(.+?)(?:\n|行动|$)", text, re.DOTALL)
-    thought = thought_match.group(1).strip() if thought_match else None
+            response = chat(
+                [
+                    {"role": "system", "content": _PLANNER_PROMPT},
+                    {"role": "user", "content": text_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=200,
+            )
+            if response.get("success"):
+                match = re.search(r"\{.*\}", response.get("content", ""), re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group(0))
+                    valid = set(TOOL_REGISTRY) | {"chain"}
+                    intent = str(parsed.get("intent", ""))
+                    confidence = float(parsed.get("confidence", 0.0))
+                    if intent in valid and confidence >= 0.5:
+                        return {
+                            "intent": intent,
+                            "confidence": confidence,
+                            "params": parsed.get("params", {}),
+                            "source": "llm",
+                        }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
 
-    # Extract action JSON
-    action_match = re.search(r"行动[：]\s*(.+?)(?:$)", text, re.DOTALL)
-    if not action_match:
-        return thought, None, "Could not find '行动： in LLM response"
-
-    raw_action = action_match.group(1).strip()
-
-    # Clean JSON: remove markdown fences and surrounding noise
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw_action)
-    cleaned = re.sub(r"```", "", cleaned)
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1:
-        return thought, None, f"No JSON object found in action: {raw_action[:100]}"
-    cleaned = cleaned[start:end + 1]
-
-    try:
-        action = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        return thought, None, f"JSON parse error: {e} | raw: {cleaned[:100]}"
-
-    if "tool" not in action:
-        return thought, None, "Action JSON missing 'tool' key"
-
-    return thought, action, None
-
-
-def _format_observation(tool_name: str, result: dict) -> str:
-    """Format a tool result as a concise observation string for the LLM."""
-    if result.get("_finish"):
-        return "[finish] task complete"
-
-    if "error" in result:
-        return f"[error] {tool_name}: {result['error']}"
-
-    if tool_name == "detect":
-        dets = result.get("detections", [])
-        msg = result.get("message", "")
-        classes = list({d["class_name"] for d in dets})
-        return json.dumps({
-            "tool": "detect",
-            "objects_found": len(dets),
-            "classes": classes,
-            "summary": msg,
-        }, ensure_ascii=False)
-
-    if tool_name == "rag":
-        answer = result.get("answer", "")
-        return json.dumps({
-            "tool": "rag",
-            "answer_preview": answer[:300],
-            "sources": result.get("source_files", []),
-        }, ensure_ascii=False)
-
-    if tool_name == "event_log":
-        return json.dumps({
-            "tool": "event_log",
-            "log_exists": result.get("log_exists", False),
-            "total_events": result.get("total_events", 0),
-            "total_alarms": result.get("total_alarms", 0),
-            "by_alarm_level": result.get("by_alarm_level", {}),
-            "recent_alarm_count": result.get("recent_alarm_count", 0),
-        }, ensure_ascii=False)
-
-    if tool_name == "fire_log":
-        return json.dumps({
-            "tool": "fire_log",
-            "log_exists": result.get("log_exists", False),
-            "total_alarms": result.get("total_alarms", 0),
-            "by_level": result.get("by_level", {}),
-        }, ensure_ascii=False)
-
-    if tool_name == "inspection_report":
-        return json.dumps({
-            "tool": "inspection_report",
-            "log_exists": result.get("log_exists", False),
-            "total_events": result.get("total_events", 0),
-            "total_alarms": result.get("total_alarms", 0),
-            "report_path": result.get("report_path"),
-        }, ensure_ascii=False)
-
-    # Default: return a compact summary
-    return json.dumps({"tool": tool_name, "result": str(result)[:200]}, ensure_ascii=False)
-
-
-def _call_tool_react(tool_name: str, params: dict, media=None):
-    """Execute a tool from TOOL_REGISTRY with given params and media."""
-    if tool_name == "finish":
-        return {"answer": params.get("answer", ""), "_finish": True}
-
-    if tool_name not in TOOL_REGISTRY:
-        return {"error": f"Unknown tool '{tool_name}'. Available: {list(TOOL_REGISTRY.keys())}"}
-
-    tool_fn, _ = TOOL_REGISTRY[tool_name]
-
-    try:
-        if tool_name == "detect":
-            if media is None:
-                return {"tool": "detect", "error": "No image provided. Please upload an image first."}
-            if isinstance(media, np.ndarray):
-                temp_path = _save_numpy_as_rgb(media)
-                return tool_fn(image_path=temp_path, conf=params.get("conf", 0.25))
-            if isinstance(media, str):
-                return tool_fn(image_path=media, conf=params.get("conf", 0.25))
-            return {"tool": "detect", "error": f"Unsupported media type: {type(media)}"}
-
-        if tool_name == "rag":
-            question = params.get("question", "")
-            if not question:
-                return {"tool": "rag", "error": "No question provided for RAG query."}
-            return tool_fn(question=question)
-
-        if tool_name in ("event_log", "fire_log", "inspection_report", "log", "deploy", "analyze"):
-            return tool_fn()
-
-        # Fallback for other tools
-        return tool_fn()
-
-    except Exception as exc:
-        return {"tool": tool_name, "error": str(exc)}
-
-
-def run_agent_with_react(
-    text_prompt: str,
-    media=None,
-    max_steps: int = 2,
-) -> dict:
-    """Lightweight ReAct loop: think, act, observe, repeat.
-
-    The LLM decides which tool to call each round, sees the result,
-    and either continues or calls 'finish' to return the final answer.
-
-    Returns the same format as run_agent(), plus a "steps" field.
-    """
-    from app.llm.deepseek_client import chat
-
-    steps: list[dict] = []
-
-    # ---- Build initial messages ----
-    media_hint = "" if media is None else " [An image is available for detection]"
-    messages = [
-        {"role": "system", "content": _REACT_SYSTEM_PROMPT},
-        {"role": "user", "content": f"User request: {text_prompt}{media_hint}"},
-    ]
-
-    final_answer = ""
-
-    for step_idx in range(max_steps):
-        # ---- Call LLM ----
-        llm_result = chat(messages, temperature=0.0, max_tokens=600)
-
-        if not llm_result.get("success"):
-            steps.append({
-                "step": step_idx + 1,
-                "thought": "", "action": None, "observation": "",
-                "error": f"LLM call failed: {llm_result.get('error')}",
-            })
-            final_answer = "Sorry, the LLM service is currently unavailable. Please try again later."
-            break
-
-        raw_response = llm_result["content"]
-
-        # ---- Parse ----
-        thought, action, parse_error = _parse_react_output(raw_response)
-
-        if parse_error:
-            steps.append({
-                "step": step_idx + 1,
-                "thought": thought or "", "action": None, "observation": "",
-                "error": parse_error, "raw_response": raw_response[:200],
-            })
-            final_answer = "Sorry, I encountered an issue processing your request. Please try again."
-            break
-
-        tool_name = action.get("tool", "")
-        tool_params = action.get("params", {})
-
-        # ---- Execute tool ----
-        tool_result = _call_tool_react(tool_name, tool_params, media)
-        observation = _format_observation(tool_name, tool_result)
-
-        steps.append({
-            "step": step_idx + 1,
-            "thought": thought or "",
-            "tool": tool_name,
-            "params": tool_params,
-            "observation": observation,
-        })
-
-        # ---- Check if finish ----
-        if tool_result.get("_finish"):
-            final_answer = tool_result.get("answer", "")
-            break
-
-        # ---- Append to conversation for next round ----
-        messages.append({"role": "assistant", "content": raw_response})
-        messages.append({"role": "user", "content": f"Observation: {observation}"})
-
-    # ---- If loop finished without calling finish, ask LLM to summarize ----
-    if not final_answer and steps:
-        summary_prompt = f"Based on the observations above, write a concise answer to the user's request: '{text_prompt}'"
-        messages.append({"role": "user", "content": summary_prompt})
-        summary_result = chat(messages, temperature=0.2, max_tokens=500)
-        if summary_result.get("success"):
-            final_answer = summary_result["content"]
-        else:
-            final_answer = "Sorry, I was unable to complete the analysis. Please try again."
-
-    # ---- Build unified result ----
     return {
-        "intent": "react",
-        "result": {
-            "answer": final_answer,
-            "steps": steps,
-        },
-        "error": None,
-        "annotated_image": None,
-        "intent_info": {"intent": "react", "confidence": 1.0, "params": {}, "source": "react"},
+        "intent": parse_intent(text_prompt),
+        "confidence": 1.0,
+        "params": {},
+        "source": "rule",
     }
 
 
-# ---------------------------------------------------------------------------
-# main agent loop
-# ---------------------------------------------------------------------------
+def _media_path(media: Media) -> str | int | None:
+    if media is None:
+        return None
+    if isinstance(media, np.ndarray):
+        return save_numpy_as_rgb(media)
+    if isinstance(media, Path):
+        return str(media)
+    return media
+
+
+def _read_rgb(path: str | None) -> np.ndarray | None:
+    if not path or not Path(path).exists():
+        return None
+    image = cv2.imread(path)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image is not None else None
+
+
+def _tool_detect(media: Media, prompt: str, params: dict[str, Any]) -> tuple[ToolResult, np.ndarray | None]:
+    source = _media_path(media)
+    if source is None:
+        return tool_error("detect", "No image or video source was provided."), None
+
+    from app.runtime.unified_pipeline import _detect_image, _detect_video
+
+    task = str(params.get("task", "general"))
+    confidence = float(params.get("confidence", params.get("conf", DEFAULT_CONFIDENCE)))
+    source_text = str(source)
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+    if isinstance(source, str) and Path(source).suffix.lower() in image_extensions:
+        result = _detect_image(source, confidence, task)
+        output_image = result.get("output_image")
+        artifacts = {"output_image": output_image} if output_image else {}
+        return (
+            tool_success("detect", result.get("message", "Detection complete."), result, artifacts),
+            _read_rgb(output_image),
+        )
+
+    video_source: str | int = int(source_text) if source_text.isdigit() else source_text
+    result = _detect_video(
+        video_source,
+        confidence,
+        int(params.get("frame_stride", 5)),
+        int(params.get("max_frames", 300)),
+        task,
+    )
+    if result.get("video_path") is None:
+        return tool_error("detect", result.get("summary_md", "Could not open video source.")), None
+    artifacts = {
+        "video_path": result.get("video_path"),
+        "log_path": result.get("log_path"),
+        "alarm_images": result.get("alarm_images", []),
+    }
+    return tool_success("detect", result["summary_md"], result, artifacts), None
+
+
+def _tool_detect_open(
+    media: Media, prompt: str, params: dict[str, Any]
+) -> tuple[ToolResult, np.ndarray | None]:
+    if media is None:
+        return tool_error("detect_open", "No image was provided."), None
+    from app.tools.grounding_tool import detect_open
+    from app.utils.vis_utils import draw_boxes
+
+    if isinstance(media, np.ndarray):
+        image = media
+    else:
+        path = Path(str(_media_path(media)))
+        if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}:
+            return tool_error("detect_open", "Open-vocabulary detection currently supports image input only."), None
+        image = cv2.imread(str(path))
+        if image is None:
+            return tool_error("detect_open", "The image could not be read."), None
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    result = detect_open(
+        image,
+        prompt,
+        box_threshold=float(params.get("confidence", GROUNDING_BOX_THRESHOLD)),
+        classes=params.get("classes"),
+    )
+    annotated = draw_boxes(
+        image.copy(),
+        result.get("boxes", []),
+        labels=result.get("phrases", []),
+        scores=result.get("scores", []),
+    )
+    return tool_success("detect_open", result.get("message", "Detection complete."), result), annotated
+
+
+def _tool_rag(media: Media, prompt: str, params: dict[str, Any]) -> tuple[ToolResult, None]:
+    from app.rag.rag_tool import rag_query
+
+    result = rag_query(
+        question=params.get("question", prompt),
+        top_k=int(params.get("top_k", 4)),
+        use_llm=bool(params.get("use_llm", False)),
+        history=params.get("history"),
+    )
+    return tool_success("rag", result.get("answer", ""), result), None
+
+
+def _tool_event_log(media: Media, prompt: str, params: dict[str, Any]) -> tuple[ToolResult, None]:
+    from app.tools.event_log_tool import query_event_log
+
+    result = query_event_log()
+    return tool_success("event_log", "Event log query complete.", result), None
+
+
+def _tool_fire_log(media: Media, prompt: str, params: dict[str, Any]) -> tuple[ToolResult, None]:
+    from app.tools.fire_log_tool import query_fire_log
+
+    result = query_fire_log()
+    return tool_success("fire_log", "Fire alarm log query complete.", result), None
+
+
+def _tool_report(media: Media, prompt: str, params: dict[str, Any]) -> tuple[ToolResult, None]:
+    from app.tools.event_log_tool import generate_inspection_report
+
+    result = generate_inspection_report()
+    artifacts = {"report_path": result.get("report_path")} if result.get("report_path") else {}
+    return tool_success("inspection_report", "Inspection report generated.", result, artifacts), None
+
+
+def _tool_disposal(media: Media, prompt: str, params: dict[str, Any]) -> tuple[ToolResult, None]:
+    from app.agents.graph import run_disposal
+
+    alarm_data = params.get("alarm_data", prompt)
+    result = run_disposal(alarm_data)
+    if result.get("error"):
+        return tool_error("disposal", result["error"]), None
+    return tool_success("disposal", "Disposal workflow complete.", result), None
+
+
+TOOL_REGISTRY: dict[str, ToolHandler] = {
+    "detect": _tool_detect,
+    "detect_open": _tool_detect_open,
+    "rag": _tool_rag,
+    "event_log": _tool_event_log,
+    "fire_log": _tool_fire_log,
+    "inspection_report": _tool_report,
+    "disposal": _tool_disposal,
+}
+
+
+def planned_tools(intent: str) -> list[str]:
+    """Return the deterministic tool sequence for an intent."""
+    if intent == "chain":
+        return ["detect", "rag"]
+    if intent in TOOL_REGISTRY:
+        return [intent]
+    return []
+
+
+def _execute_tool(
+    tool_name: str,
+    media: Media,
+    prompt: str,
+    params: dict[str, Any],
+) -> tuple[ToolResult, np.ndarray | None, dict[str, Any]]:
+    started = time.perf_counter()
+    handler = TOOL_REGISTRY.get(tool_name)
+    if handler is None:
+        result = tool_error(tool_name, f"Unknown tool '{tool_name}'.")
+        annotated = None
+    else:
+        try:
+            result, annotated = handler(media, prompt, params)
+        except Exception as exc:
+            result, annotated = tool_error(tool_name, str(exc)), None
+    step = {
+        "tool": tool_name,
+        "status": "ok" if result["ok"] else "error",
+        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+        "summary": result["summary"][:300],
+    }
+    return result, annotated, step
+
+
+def _chain_question(detections: list[dict[str, Any]]) -> str:
+    translations = {
+        "person": "人员",
+        "fire": "火焰",
+        "smoke": "烟雾",
+        "helmet": "安全帽",
+        "no-helmet": "未佩戴安全帽",
+        "vest": "反光衣",
+        "no-vest": "未穿反光衣",
+    }
+    classes = sorted({str(item.get("class_name", "")) for item in detections if item.get("class_name")})
+    names = "、".join(translations.get(name, name) for name in classes)
+    return f"检测到 {names or '相关目标'}，请给出对应的工业安全规范和处置建议。"
+
+
+def _run_chain(
+    media: Media,
+    text_prompt: str,
+    params: dict[str, Any],
+) -> tuple[ToolResult, np.ndarray | None, list[dict[str, Any]]]:
+    detect_result, annotated, detect_step = _execute_tool("detect", media, text_prompt, params)
+    trace = [detect_step]
+    if not detect_result["ok"]:
+        return detect_result, annotated, trace
+
+    data = detect_result["data"]
+    detections = data.get("detections", data.get("detections_json", {}).get("detections", []))
+    question = _chain_question(detections)
+    rag_params = {
+        "question": question,
+        "top_k": params.get("top_k", 4),
+        "use_llm": params.get("use_llm", False),
+    }
+    rag_result, _, rag_step = _execute_tool("rag", None, question, rag_params)
+    trace.append(rag_step)
+    merged = {
+        "detection": data,
+        "rag": rag_result["data"],
+        "answer": rag_result["summary"],
+        "question": question,
+    }
+    artifacts = dict(detect_result["artifacts"])
+    result = tool_success("chain", rag_result["summary"], merged, artifacts)
+    if not rag_result["ok"]:
+        result = tool_error("chain", rag_result["error"] or "RAG query failed.")
+        result["data"] = merged
+        result["artifacts"] = artifacts
+    return result, annotated, trace
 
 
 def run_agent(
-    image: np.ndarray | None,
-    text_prompt: str,
+    image: Media = None,
+    text_prompt: str = "",
     **kwargs: Any,
-) -> dict:
-    """Main agent loop -- parse intent, call the right tool, return results.
+) -> AgentResponse:
+    """Plan and execute one request through the registered real tools."""
+    explicit_task = str(kwargs.get("task", "auto") or "auto").lower()
+    use_llm = bool(kwargs.get("use_llm", LLM_ENABLED))
 
-    Supports:
-    - Single-tool dispatch (detect, rag, event_log, etc.)
-    - Multi-step chain: detect -> RAG (when text contains "??...?...??")
+    if explicit_task == "auto" and image is not None and not _is_chain_query(text_prompt):
+        lowered = text_prompt.lower()
+        if any(word in lowered for word in ("fire", "smoke", "火灾", "火焰", "烟雾")):
+            explicit_task = "fire"
+        elif any(word in lowered for word in ("ppe", "helmet", "vest", "安全帽", "反光衣")):
+            explicit_task = "ppe"
+        else:
+            explicit_task = "general"
 
-    Returns:
-        dict with keys:
-            intent, result (tool output dict),
-            error (str or None), annotated_image (RGB numpy or None),
-            intent_info (dict with LLM parse details).
-    """
-    # ---- Intent parsing: LLM first, keyword fallback ----
-    intent_info = parse_intent_with_llm(text_prompt)
-
-    # ---- ReAct routing: complex queries that need multi-step reasoning ----
-    should_use_react = (
-        intent_info["intent"] == "chain"
-        or any(kw in text_prompt for kw in _REACT_KEYWORDS)
-    )
-    if should_use_react:
-        try:
-            return run_agent_with_react(text_prompt, media=image, max_steps=2)
-        except Exception as exc:
-            return {
-                "intent": "react",
-                "result": {"answer": f"ReAct failed: {exc}", "steps": []},
-                "error": str(exc),
-                "annotated_image": None,
-                "intent_info": intent_info,
-            }
-
-    # Auto-convert detect+need_rag to chain when media is available
-    if (
-        intent_info["intent"] == "detect"
-        and intent_info.get("params", {}).get("need_rag", False)
+    if explicit_task == "open":
+        intent_info = {
+            "intent": "detect_open",
+            "confidence": 1.0,
+            "params": {},
+            "source": "explicit",
+        }
+    elif (
+        explicit_task in {"general", "fire", "ppe"}
         and image is not None
+        and not _is_chain_query(text_prompt)
     ):
-        intent_info["intent"] = "chain"
-        intent_info["confidence"] = max(intent_info.get("confidence", 0), 0.8)
+        intent_info = {
+            "intent": "detect",
+            "confidence": 1.0,
+            "params": {"task": explicit_task},
+            "source": "explicit",
+        }
+    else:
+        intent_info = parse_intent_with_llm(text_prompt, use_llm=use_llm)
 
     intent = intent_info["intent"]
+    params = dict(intent_info.get("params", {}))
+    params.update({key: value for key, value in kwargs.items() if key not in {"task", "use_llm"}})
+    if explicit_task in {"general", "fire", "ppe"}:
+        params["task"] = explicit_task
+    elif intent == "detect":
+        params.setdefault("task", "general")
+    params["use_llm"] = use_llm
 
-    # ---- Multi-step chain: detect -> RAG ----
     if intent == "chain":
-        try:
-            chain_result, annotated = _run_chain(image, text_prompt, **kwargs)
-            return {
-                "intent": "chain",
-                "result": chain_result,
-                "error": None,
-                "annotated_image": annotated,
-                "intent_info": intent_info,
-            }
-        except Exception as exc:
-            return {
-                "intent": "chain",
-                "result": {
-                    "answer": f"???????{exc}",
-                    "detections": [],
-                    "rag_answer": None,
-                    "used_chain": True,
-                    "decision_trace": [f"chain error: {exc}"],
-                },
-                "error": str(exc),
-                "annotated_image": None,
-                "intent_info": intent_info,
-            }
+        tool_result, annotated, trace = _run_chain(image, text_prompt, params)
+    else:
+        tool_result, annotated, step = _execute_tool(intent, image, text_prompt, params)
+        trace = [step]
 
-    # ---- Single-tool dispatch ----
-    if intent not in TOOL_REGISTRY:
-        return {
-            "intent": intent,
-            "result": None,
-            "error": f"Unknown tool '{intent}'. Available: {list(TOOL_REGISTRY.keys())}",
-            "annotated_image": None,
-            "intent_info": intent_info,
-        }
+    result_data = dict(tool_result["data"])
+    if tool_result["summary"] and "answer" not in result_data:
+        result_data.setdefault("message", tool_result["summary"])
 
-    tool_fn, _ = TOOL_REGISTRY[intent]
-
-    try:
-        # ---- YOLO detect ----
-        if intent == "detect":
-            if image is None:
-                result = {
-                    "tool": "yolo_detect",
-                    "message": "[Error] No image provided. Please upload an image first.",
-                }
-            else:
-                temp_path = _save_numpy_as_rgb(image)
-                from app.runtime.unified_pipeline import _detect_image
-                result = _detect_image(temp_path, conf=kwargs.get("conf", 0.25))
-
-        # ---- Open-vocabulary detect (mock) ----
-        elif intent == "detect_open":
-            result = tool_fn(image, text_prompt, **kwargs) if image is not None else {"error": "No image provided"}
-
-        # ---- Segment (mock) ----
-        elif intent == "segment":
-            result = tool_fn(image, **kwargs) if image is not None else {"error": "No image provided"}
-
-        # ---- Analyze dataset (no image needed) ----
-        elif intent == "analyze":
-            result = tool_fn(**kwargs)
-
-        # ---- Log analysis (no image needed) ----
-        elif intent == "log":
-            result = tool_fn()
-
-        # ---- Fire alarm log analysis (no image needed) ----
-        elif intent == "fire_log":
-            result = tool_fn()
-
-        # ---- Unified event log analysis (no image needed) ----
-        elif intent == "event_log":
-            result = tool_fn()
-
-        # ---- Inspection report (no image needed) ----
-        elif intent == "inspection_report":
-            result = tool_fn()
-
-        # ---- RAG knowledge base Q&A ----
-        elif intent == "rag":
-            # Check if the query also references logs/alarms
-            log_keywords = ("??", "????", "high", "??", "??", "??")
-            log_context = None
-            if any(w in text_prompt for w in log_keywords):
-                log_context = query_event_log()
-            result = rag_query(question=text_prompt, log_context=log_context)
-
-        # ---- Report (uses detect internally) ----
-        elif intent == "report":
-            if image is not None:
-                temp_path = _save_numpy_as_rgb(image)
-                detections = detect(image_path=temp_path)
-                mask_result = segment(image)
-                result = tool_fn(image, detections=detections, masks=mask_result, **kwargs)
-            else:
-                result = {"error": "No image provided for report"}
-
-        elif intent == "deploy":
-            result = tool_fn(**kwargs)
-
-        else:
-            result = {"error": f"Unknown intent: {intent}"}
-
-        # ---- Build annotated image for display ----
-        annotated = None
-
-        if intent == "detect":
-            out_img = result.get("output_image")
-            if out_img and Path(out_img).exists():
-                annotated = cv2.imread(out_img)
-                annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
-        elif intent == "log":
-            pass
-
-        elif intent == "fire_log":
-            recent = result.get("recent", [])
-            if recent:
-                newest = recent[0]
-                img_path = newest.get("alarm_image", "")
-                if img_path and Path(img_path).exists():
-                    annotated = cv2.imread(str(img_path))
-                    annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
-        elif intent == "event_log":
-            recent = result.get("recent_alarms", [])
-            if recent:
-                newest = recent[0]
-                img_path = newest.get("alarm_image", "")
-                if img_path and Path(img_path).exists():
-                    annotated = cv2.imread(str(img_path))
-                    annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
-        elif intent == "inspection_report":
-            alarm_imgs = result.get("alarm_images", [])
-            if alarm_imgs:
-                img_path = alarm_imgs[0]
-                if img_path and Path(img_path).exists():
-                    annotated = cv2.imread(str(img_path))
-                    annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
-        elif intent == "rag":
-            log_ctx = result.get("log_context", {})
-            if log_ctx and log_ctx.get("log_exists"):
-                recent = log_ctx.get("recent_alarms", [])
-                if recent:
-                    img_path = recent[0].get("alarm_image", "")
-                    if img_path and Path(img_path).exists():
-                        annotated = cv2.imread(str(img_path))
-                        annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
-        elif image is not None and intent in ("detect_open", "segment", "report"):
-            from app.utils.vis_utils import draw_boxes, draw_masks, draw_labels
-            annotated = image.copy()
-
-            if intent == "detect_open" and "boxes" in result:
-                annotated = draw_boxes(annotated, result["boxes"],
-                                       labels=result.get("phrases"),
-                                       scores=result.get("scores"))
-
-            if intent == "segment" and "masks" in result:
-                annotated = draw_masks(annotated, result["masks"])
-
-            if intent == "report" and "boxes" in result:
-                annotated = draw_boxes(annotated, result["boxes"],
-                                       labels=result.get("labels"),
-                                       scores=result.get("scores"))
-
-            summary_lines = _build_summary_lines(intent, result)
-            annotated = draw_labels(annotated, summary_lines)
-
-        return {
-            "intent": intent,
-            "result": result,
-            "error": None,
-            "annotated_image": annotated,
-            "intent_info": intent_info,
-        }
-
-    except Exception as exc:
-        return {
-            "intent": intent,
-            "result": None,
-            "error": str(exc),
-            "annotated_image": None,
-            "intent_info": intent_info,
-        }
+    planner_source = intent_info.get("source", "rule")
+    return {
+        "ok": tool_result["ok"],
+        "intent": intent,
+        "result": result_data,
+        "error": tool_result["error"],
+        "artifacts": tool_result["artifacts"],
+        "trace": trace,
+        "planner_source": planner_source,
+        "intent_info": intent_info,
+        "annotated_image": annotated,
+    }
 
 
-# ---------------------------------------------------------------------------
-# summary helpers
-# ---------------------------------------------------------------------------
+def run_agent_with_react(text_prompt: str, media: Media = None, max_steps: int = 2) -> AgentResponse:
+    """Backward-compatible entry point for the removed free-form ReAct loop.
 
-def _build_summary_lines(intent: str, result: dict) -> list:
-    """Build a short text summary overlay for the annotated image."""
-    tool_name = result.get("tool", intent)
-    lines = [f"Tool: {tool_name}"]
-    mp = result.get("model_path")
-    if mp:
-        from pathlib import Path as _P
-        lines.append(f"Model: {_P(mp).name}")
+    The bounded orchestrator is deliberately used instead; ``max_steps`` is
+    retained only to avoid breaking callers from the earlier prototype.
+    """
+    del max_steps
+    return run_agent(image=media, text_prompt=text_prompt, use_llm=LLM_ENABLED)
 
-    if intent == "detect":
-        msg = result.get("message", "")
-        if msg:
-            lines.append(msg)
-    elif intent in ("log", "event_log"):
-        lines.append(f"Total detections: {result.get('total', 0)}")
-        classes = result.get("class_distribution", {})
-        if classes:
-            lines.append("Per class:")
-            for name, cnt in list(classes.items())[:6]:
-                lines.append(f"  {name}: {cnt}")
-            if len(classes) > 6:
-                lines.append(f"  ... +{len(classes) - 6} more")
-        lc = result.get("low_confidence_count", 0)
-        th = result.get("threshold", 0.3)
-        lines.append(f"Low-confidence (< {th}): {lc} sample(s)")
-    elif intent == "detect_open":
-        phrases = result.get("phrases", [])
-        lines.append(f"Query: '{result.get('prompt', 'N/A')}'")
-        lines.append(f"Matched: {', '.join(phrases) if phrases else 'none'}")
-    elif intent == "segment":
-        n = result.get("num_masks", 0)
-        lines.append(f"Segmented {n} region(s)")
-    elif intent == "report":
-        if isinstance(result.get("summary"), str):
-            lines.extend(result["summary"].split("\n")[:5])
 
-    return lines
+_save_numpy_as_rgb = save_numpy_as_rgb
+_build_summary_lines = _summary_lines

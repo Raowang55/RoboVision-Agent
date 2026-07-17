@@ -1,8 +1,10 @@
+# -*- coding: utf-8 -*-
 """File-system utility helpers."""
 
 import time
 from pathlib import Path
-from typing import List
+
+from app.config import OUTPUT_DIR
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -12,7 +14,7 @@ def ensure_dir(path: str | Path) -> Path:
     return p
 
 
-def list_images(directory: str | Path, extensions: tuple = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")) -> List[Path]:
+def list_images(directory: str | Path, extensions: tuple = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")) -> list[Path]:
     """Return a sorted list of image file paths in a directory (non-recursive)."""
     d = Path(directory)
     if not d.exists():
@@ -21,7 +23,7 @@ def list_images(directory: str | Path, extensions: tuple = (".jpg", ".jpeg", ".p
     return sorted(files)
 
 
-def get_output_path(prefix: str = "output", ext: str = ".png", directory: str = "data/outputs") -> Path:
+def get_output_path(prefix: str = "output", ext: str = ".png", directory: str = str(OUTPUT_DIR)) -> Path:
     """Generate a timestamped output file path."""
     ts = time.strftime("%Y%m%d_%H%M%S")
     return Path(directory) / f"{prefix}_{ts}{ext}"

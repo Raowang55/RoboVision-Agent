@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 app/rag/chroma_db/
 app/rag/models/
 __pycache__/
@@ -8,3 +10,26 @@ weights/*.pt
 *.pt
 *.log
 server_log.txt
+output/
+
+# Gradio temp uploads (safe path for special-char usernames)
+data/.gradio_temp/
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Ruff cache
+.ruff_cache/
+
+# Pytest cache
+.pytest_cache/
+
+# Browser automation session files
+.playwright-cli/

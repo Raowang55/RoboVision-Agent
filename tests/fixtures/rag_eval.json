@@ -1,0 +1,14 @@
+[
+  {"question": "检测到火焰后应该如何疏散和上报？", "expected_source": "fire_safety.md"},
+  {"question": "烟雾持续多少帧会触发告警？", "expected_source": "fire_safety.md"},
+  {"question": "安全帽和反光衣的穿戴要求是什么？", "expected_source": "ppe_rules.md"},
+  {"question": "发现未佩戴安全帽应如何分级？", "expected_source": "ppe_rules.md"},
+  {"question": "怎样生成每日巡检报告？", "expected_source": "inspection_report.md"},
+  {"question": "巡检报告包含哪些统计字段？", "expected_source": "inspection_report.md"},
+  {"question": "页面无法打开时应该检查什么？", "expected_source": "ops_troubleshoot.md"},
+  {"question": "模型权重缺失如何排查？", "expected_source": "ops_troubleshoot.md"},
+  {"question": "如何在本地启动 Web 控制台？", "expected_source": "deployment_guide.md"},
+  {"question": "Jetson 部署需要注意哪些资源限制？", "expected_source": "deployment_guide.md"},
+  {"question": "这个项目支持哪些输入媒体？", "expected_source": "project_manual.md"},
+  {"question": "Agent 调度器可以调用哪些核心能力？", "expected_source": "project_manual.md"}
+]

@@ -1,18 +1,21 @@
+# -*- coding: utf-8 -*-
 """Unified event log analysis tool.
 
 Reads data/logs/event_log.csv and provides query / summary capabilities.
 """
 
 import csv
+import time
 from collections import Counter
 from pathlib import Path
-import time
+
+from app.config import LOW_CONF_THRESHOLD, REPORTS_DIR
 
 
 def query_event_log(
     log_path: str = "data/logs/event_log.csv",
     recent_n: int = 10,
-    low_conf_threshold: float = 0.3,
+    low_conf_threshold: float = LOW_CONF_THRESHOLD,
 ) -> dict:
     """Read the unified event log and build a query result dict.
 
@@ -58,7 +61,7 @@ def query_event_log(
         }
 
     records: list[dict] = []
-    with open(log_path, "r", encoding="utf-8") as f:
+    with open(log_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             records.append(row)
@@ -106,6 +109,172 @@ def query_event_log(
         "low_confidence_count": len(low_conf),
         "threshold": low_conf_threshold,
     }
+
+
+def query_event_log_filtered(
+    log_path: str = "data/logs/event_log.csv",
+    alarm_level: str = "ALL",
+    event_type: str = "ALL",
+    start_date: str = "",
+    end_date: str = "",
+    recent_n: int = 20,
+) -> dict:
+    """Read the unified event log with structured filtering.
+
+    Args:
+        log_path:      Path to the CSV log file.
+        alarm_level:   Filter by alarm level (ALL, HIGH, MEDIUM, LOW).
+        event_type:    Filter by class_name (ALL, fire, smoke, no_helmet, no_vest).
+        start_date:    Start date filter (YYYY-MM-DD), empty = no lower bound.
+        end_date:      End date filter (YYYY-MM-DD), empty = no upper bound.
+        recent_n:      Max number of filtered records to return.
+
+    Returns:
+        dict with:
+            - log_exists:        bool
+            - total:             int  (total records in file)
+            - filtered_count:    int  (records after applying filters)
+            - records:           list[dict]  -- filtered records, newest first
+            - alarm_images:      list[str]  -- alarm image paths that exist
+            - stats:             dict  -- {HIGH: N, MEDIUM: N, LOW: N} counts
+    """
+    from datetime import datetime as dt_datetime
+
+    log_path = Path(log_path)
+
+    if not log_path.exists():
+        return {
+            "log_exists": False,
+            "total": 0,
+            "filtered_count": 0,
+            "records": [],
+            "alarm_images": [],
+            "stats": {},
+            "error": f"Event log not found: {log_path}",
+        }
+
+    records: list[dict] = []
+    with open(log_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            records.append(row)
+
+    total = len(records)
+
+    # Filter by alarm_level
+    if alarm_level != "ALL":
+        records = [
+            r for r in records
+            if r.get("alarm_level", "").upper() == alarm_level.upper()
+        ]
+
+    # Filter by event_type (match against class_name column)
+    if event_type != "ALL":
+        records = [
+            r for r in records
+            if r.get("class_name", "").lower() == event_type.lower()
+        ]
+
+    # Filter by date range (match against timestamp column)
+    if start_date:
+        try:
+            start_dt = dt_datetime.strptime(start_date, "%Y-%m-%d")
+            records = [
+                r for r in records
+                if dt_datetime.strptime(r.get("timestamp", "1970-01-01")[:10], "%Y-%m-%d") >= start_dt
+            ]
+        except ValueError:
+            pass  # invalid date format, skip filter
+
+    if end_date:
+        try:
+            end_dt = dt_datetime.strptime(end_date, "%Y-%m-%d")
+            records = [
+                r for r in records
+                if dt_datetime.strptime(r.get("timestamp", "1970-01-01")[:10], "%Y-%m-%d") <= end_dt
+            ]
+        except ValueError:
+            pass  # invalid date format, skip filter
+
+    filtered_count = len(records)
+
+    # Take most recent N records (reversed so newest first)
+    display_records = records[-recent_n:] if records else []
+    display_records.reverse()
+
+    # Collect alarm images that exist on disk
+    alarm_images: list[str] = []
+    for rec in display_records:
+        img = rec.get("alarm_image", "")
+        if img and Path(img).exists():
+            alarm_images.append(str(img))
+
+    # Stats by alarm level
+    level_counter = Counter(
+        r.get("alarm_level", "UNKNOWN") for r in records
+    )
+    stats = dict(level_counter.most_common())
+
+    return {
+        "log_exists": True,
+        "total": total,
+        "filtered_count": filtered_count,
+        "records": display_records,
+        "alarm_images": alarm_images,
+        "stats": stats,
+    }
+
+
+def export_log_csv(
+    log_path: str = "data/logs/event_log.csv",
+    output_path: str = "data/reports/log_export.csv",
+    alarm_level: str = "ALL",
+    event_type: str = "ALL",
+    start_date: str = "",
+    end_date: str = "",
+) -> str:
+    """Export filtered event log records to a CSV file for download.
+
+    Args:
+        log_path:      Path to the source CSV log file.
+        output_path:   Path for the exported CSV file.
+        alarm_level:   Filter by alarm level (ALL, HIGH, MEDIUM, LOW).
+        event_type:    Filter by class_name (ALL, fire, smoke, no_helmet, no_vest).
+        start_date:    Start date filter (YYYY-MM-DD), empty = no lower bound.
+        end_date:      End date filter (YYYY-MM-DD), empty = no upper bound.
+
+    Returns:
+        The output file path (str). Returns empty string if source log not found.
+    """
+    log_path_obj = Path(log_path)
+
+    if not log_path_obj.exists():
+        return ""
+
+    # Use query_event_log_filtered to get filtered records
+    result = query_event_log_filtered(
+        log_path=log_path,
+        alarm_level=alarm_level,
+        event_type=event_type,
+        start_date=start_date,
+        end_date=end_date,
+        recent_n=999999,  # export all filtered, not just recent
+    )
+
+    if not result.get("log_exists") or not result.get("records"):
+        return ""
+
+    # Write filtered records to output CSV
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = result["records"][0].keys() if result["records"] else []
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(result["records"])
+
+    return str(out_path)
 
 
 def build_summary_markdown(result: dict) -> str:
@@ -170,7 +339,7 @@ def build_summary_markdown(result: dict) -> str:
 
 def generate_inspection_report(
     log_path: str = "data/logs/event_log.csv",
-    output_dir: str = "data/reports",
+    output_dir: str = str(REPORTS_DIR),
 ) -> dict:
     """Generate a full inspection report and save it as a Markdown file.
 
@@ -183,7 +352,7 @@ def generate_inspection_report(
         - total_events, total_alarms: int
     """
     # ---- gather data ----
-    data = query_event_log(log_path=log_path, recent_n=5, low_conf_threshold=0.3)
+    data = query_event_log(log_path=log_path, recent_n=5, low_conf_threshold=LOW_CONF_THRESHOLD)
 
     if not data["log_exists"]:
         return {
@@ -208,15 +377,15 @@ def generate_inspection_report(
     ts_file = time.strftime("%Y%m%d_%H%M%S")
 
     lines = [
-        f"# RoboVision Agent \u2014 \u5de1\u68c0\u62a5\u544a",
+        "# RoboVision Agent \u2014 \u5de1\u68c0\u62a5\u544a",
         f"**\u751f\u6210\u65f6\u95f4**: {ts}",
         "",
         "---",
         "",
         "## \u6982\u89c8",
         "",
-        f"| \u6307\u6807 | \u6570\u503c |",
-        f"|------|------|",
+        "| \u6307\u6807 | \u6570\u503c |",
+        "|------|------|",
         f"| \u603b\u4e8b\u4ef6\u6570 | {data['total_events']} |",
         f"| \u62a5\u8b66\u4e8b\u4ef6\u6570 | {data['total_alarms']} |",
         f"| \u4f4e\u7f6e\u4fe1\u5ea6\u4e8b\u4ef6 (< 0.3) | {data['low_confidence_count']} |",

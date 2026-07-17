@@ -1,63 +1,33 @@
-"""Background server launcher for RoboVision-Agent."""
-from app.main import build_ui, custom_css
-from app.main import preload_embedding_model
-from app.utils.logging_config import setup_logging
-import gradio as gr
-import threading
-import time
+"""Single-process launcher for the RoboVision Gradio application."""
 
-setup_logging()
+from __future__ import annotations
 
-demo = build_ui()
-
-# Preload embedding model for RAG (synchronous, takes ~5s)
 import logging
-logger = logging.getLogger(__name__)
-logger.info("Preloading embedding model...")
-preload_embedding_model()
+import os
 
-demo.launch(
-    server_name="127.0.0.1",
-    server_port=7861,
-    css=custom_css,
-    share=False,
-    show_error=True,
-    prevent_thread_lock=True,
-)
-logger.info("Server started on http://127.0.0.1:7861")
+from app.config import GRADIO_TEMP_DIR, SERVER_HOST, SERVER_PORT, ensure_runtime_dirs
+from app.utils.logging_config import setup_logging
+from app.utils.ultralytics_patch import patch_ultralytics
 
-# ---- /health endpoint (lightweight, no extra dependencies) ----
-import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-_START_TIME = time.time()
+def main() -> None:
+    ensure_runtime_dirs()
+    os.environ["GRADIO_TEMP_DIR"] = str(GRADIO_TEMP_DIR)
+    patch_ultralytics()
+    setup_logging()
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/health":
-            body = json.dumps({
-                "status": "ok",
-                "uptime_seconds": round(time.time() - _START_TIME, 1),
-            }).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
-    def log_message(self, format, *args):
-        pass  # silence request logs
+    from app.main import _find_free_port, build_ui
 
-_health_server = HTTPServer(("127.0.0.1", 7862), _HealthHandler)
-_health_thread = threading.Thread(target=_health_server.serve_forever, daemon=True)
-_health_thread.start()
-logger.info("Health endpoint started on http://127.0.0.1:7862/health")
+    logger = logging.getLogger(__name__)
+    port = _find_free_port(SERVER_PORT)
+    logger.info("Starting RoboVision Agent on http://%s:%s", SERVER_HOST, port)
+    build_ui().launch(
+        server_name=SERVER_HOST,
+        server_port=port,
+        share=False,
+        show_error=True,
+    )
 
-# Keep alive indefinitely
-try:
-    while True:
-        time.sleep(3600)
-except KeyboardInterrupt:
-    logger.info("Server stopped.")
+
+if __name__ == "__main__":
+    main()

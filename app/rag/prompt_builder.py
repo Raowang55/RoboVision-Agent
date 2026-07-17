@@ -1,4 +1,5 @@
-"""Prompt builder for RAG-based Q&A with Qwen3-VL.
+# -*- coding: utf-8 -*-
+"""Prompt builder for RAG-based Q&A with Gemma.
 
 Constructs a system prompt that forces the model to:
 - Base answers on provided knowledge chunks
@@ -14,7 +15,7 @@ def build_rag_prompt(
     retrieved_chunks: list[dict],
     log_context: dict | None = None,
 ) -> list[dict]:
-    """Build a messages list for the Qwen3-VL chat API.
+    """Build a messages list for the Gemma chat API.
 
     Args:
         question:         The user's question.
@@ -45,7 +46,8 @@ def build_rag_prompt(
     # ---- system prompt ----
     system_prompt = f"""You are an industrial vision safety assistant called RoboVision Agent.
 
-Your job is to answer questions about industrial vision, safety regulations, alarm handling, model deployment, etc., based on knowledge base chunks and event logs.
+# Your job is to answer questions about industrial vision, safety regulations,
+# alarm handling, model deployment, and system commands based on provided context.
 
 ## Answer Requirements
 1. **Evidence Basis**: Explain which knowledge base source your judgment is based on.
@@ -56,7 +58,8 @@ Your job is to answer questions about industrial vision, safety regulations, ala
 
 ## Important Constraints
 - Only answer based on the knowledge base chunks and logs provided below.
-- If knowledge base evidence is insufficient, clearly state "Based on the available knowledge base, a definitive answer cannot be given" -- do not fabricate information.
+- If knowledge base evidence is insufficient, clearly state "Based on the available KB, cannot give a definitive answer"
+-- do not fabricate information.
 - For life-safety questions, remind users to follow actual on-site conditions.
 ---
 
@@ -79,19 +82,21 @@ def build_fallback_answer(
     retrieved_chunks: list[dict],
     log_context: dict | None = None,
 ) -> str:
-    """Build a fallback answer from retrieved chunks when LLM is unavailable.
+    """Build a retrieval-only answer without requiring an LLM.
 
     This is a simple concatenation of relevant chunks with a header.
     """
     lines = [
         f'## "{question}" 检索结果',
         "",
-        "*Qwen3-VL API 不可用，以下为检索到的知识库片段供参考：*",
+        "*当前使用离线检索模式，以下为命中的知识库片段：*",
         "",
     ]
 
     if log_context:
-        lines.append(f"- Recent events: {log_context.get('total_events', 0)} total, {log_context.get('total_alarms', 0)} alarms")
+        events = log_context.get('total_events', 0)
+        alarms = log_context.get('total_alarms', 0)
+        lines.append(f"- Recent events: {events} total, {alarms} alarms")
         lines.append("")
 
     if not retrieved_chunks:

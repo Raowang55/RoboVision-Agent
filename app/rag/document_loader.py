@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Document loader: reads .md and .txt files and splits into chunks."""
 
 from pathlib import Path

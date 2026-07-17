@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Fire / smoke alarm log analysis tool.
 
 Reads data/logs/fire_alarm_log.csv and produces summary statistics.
@@ -41,7 +42,7 @@ def query_fire_log(
         }
 
     records: list[dict] = []
-    with open(log_path, "r", encoding="utf-8") as f:
+    with open(log_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             records.append(row)

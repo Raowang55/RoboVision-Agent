@@ -4,7 +4,7 @@
 
 ## 1. 报警分级与触发条件
 
-RoboVision-Agent 通过 `app/runtime/fire_video_detector.py` 对视频帧进行 YOLO 实时检测，当检测到 `fire` 或 `smoke` 类别时，调用 `fire_alarm_rules.py` 按以下规则判定报警等级。
+RoboVision-Agent 通过 `app/runtime/unified_pipeline.py` 对视频帧进行 YOLO 抽帧检测，当检测到 `fire` 或 `smoke` 类别时，调用 `fire_alarm_rules.py` 按以下规则判定报警等级。
 
 ### 1.1 HIGH 报警（红色）
 
@@ -63,7 +63,7 @@ RoboVision-Agent 通过 `app/runtime/fire_video_detector.py` 对视频帧进行 
 
 | 系统模块 | 功能 |
 |----------|------|
-| `fire_video_detector.py` | 实时视频帧检测，调用 YOLO 模型 |
+| `unified_pipeline.py` | 图片/视频抽帧检测，调用 YOLO 模型 |
 | `fire_alarm_rules.py` | 连续帧确认 + 冷却期判定 |
 | `fire_log_tool.py` | 查询报警记录、按等级统计 |
 | `event_logger.py` | 统一事件日志写入 `event_log.csv` |

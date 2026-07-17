@@ -1,11 +1,12 @@
+# -*- coding: utf-8 -*-
 """Unified event logger for RoboVision Agent.
 
 Writes all detection and alarm events to a single CSV log.
 """
 
 import csv
-import time
 import threading
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------

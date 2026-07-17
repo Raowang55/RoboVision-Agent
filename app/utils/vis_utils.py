@@ -1,10 +1,10 @@
-"""Visualization utilities for drawing boxes, masks, and labels."""
-
-import random
-from typing import List, Optional, Tuple
+# -*- coding: utf-8 -*-
+"""Visualization utilities for drawing boxes and labels."""
 
 import cv2
 import numpy as np
+
+from app.config import VIS_FONT_SCALE
 
 # A fixed palette of distinct colours for drawing
 COLORS = [
@@ -20,9 +20,9 @@ def _get_color(idx: int) -> tuple:
 
 def draw_boxes(
     image: np.ndarray,
-    boxes: List[List[float]],
-    labels: Optional[List[str]] = None,
-    scores: Optional[List[float]] = None,
+    boxes: list[list[float]],
+    labels: list[str] | None = None,
+    scores: list[float] | None = None,
     normalized: bool = True,
 ) -> np.ndarray:
     """Draw bounding boxes on a copy of the image.
@@ -66,47 +66,11 @@ def draw_boxes(
     return vis
 
 
-def draw_masks(
-    image: np.ndarray,
-    masks: List[dict],
-    alpha: float = 0.4,
-) -> np.ndarray:
-    """Draw semi-transparent mask overlays on a copy of the image.
-
-    Since this is a mock utility, it draws semi-transparent coloured
-    rectangles for each mask's bbox as a visual placeholder.
-
-    Args:
-        image: BGR image.
-        masks: List of mask dicts (each with a 'bbox' key [x1, y1, x2, y2] in pixels).
-        alpha: Blend factor (0 = fully transparent, 1 = fully opaque).
-
-    Returns:
-        Annotated BGR image.
-    """
-    vis = image.copy()
-
-    for i, m in enumerate(masks):
-        overlay = vis.copy()
-        color = _get_color(i)
-        x1, y1, x2, y2 = m.get("bbox", [0, 0, 100, 100])
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-        cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
-
-        # Draw mask id label
-        cv2.putText(vis, f"mask #{m.get('id', i + 1)} ({m.get('score', 0):.2f})",
-                    (x1 + 4, y1 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-    return vis
-
-
 def draw_labels(
     image: np.ndarray,
-    text_lines: List[str],
-    position: Tuple[int, int] = (10, 30),
-    font_scale: float = 0.7,
+    text_lines: list[str],
+    position: tuple[int, int] = (10, 30),
+    font_scale: float = VIS_FONT_SCALE,
     color: tuple = (255, 255, 255),
     bg_color: tuple = (0, 0, 0),
 ) -> np.ndarray:

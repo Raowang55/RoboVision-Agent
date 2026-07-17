@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Fire / smoke alarm rule engine.
 
 Decides alarm levels based on consecutive-frame persistence and
@@ -5,6 +6,8 @@ cooldown logic to avoid repeated alarms.
 """
 
 import time
+
+from app.config import ALARM_COOLDOWN_SECONDS, FIRE_CONF_THRESHOLD, SMOKE_CONF_THRESHOLD
 
 
 class FireAlarmEngine:
@@ -18,19 +21,22 @@ class FireAlarmEngine:
     Cooldown prevents repeated alarms for the same event.
     """
 
-    def __init__(self, cooldown_seconds: float = 5.0):
+    def __init__(self, cooldown_seconds: float = ALARM_COOLDOWN_SECONDS):
         self._cooldown = cooldown_seconds
         self._last_alarm_time = 0.0
 
         # ── Consecutive-frame counters ──────────────────────────────
         self._fire_frames  = 0   # consecutive frames with fire
         self._smoke_frames = 0   # consecutive frames with smoke
+        self._smoke_window: list[bool] = []
 
         # ── Thresholds ──────────────────────────────────────────────
-        self.fire_conf_threshold  = 0.5
-        self.smoke_conf_threshold = 0.4
+        self.fire_conf_threshold  = FIRE_CONF_THRESHOLD
+        self.smoke_conf_threshold = SMOKE_CONF_THRESHOLD
         self.fire_min_frames      = 3
         self.smoke_min_frames     = 10
+        self.smoke_window_size    = 10
+        self.smoke_window_min_hits = 8
 
     def update(self, detections: list[dict]) -> dict | None:
         """Feed one frame's detections into the engine.
@@ -65,6 +71,9 @@ class FireAlarmEngine:
             self._smoke_frames += 1
         else:
             self._smoke_frames = 0
+        self._smoke_window.append(has_smoke)
+        if len(self._smoke_window) > self.smoke_window_size:
+            self._smoke_window.pop(0)
 
         # ── Decide alarm ────────────────────────────────────────────
         alarm = None
@@ -91,6 +100,20 @@ class FireAlarmEngine:
                 "smoke", "MEDIUM",
                 detections,
                 f"Smoke detected for {self._smoke_frames} consecutive frames",
+            )
+        elif (
+            has_smoke
+            and
+            len(self._smoke_window) == self.smoke_window_size
+            and sum(self._smoke_window) >= self.smoke_window_min_hits
+        ):
+            alarm = self._build_alarm(
+                "smoke", "MEDIUM",
+                detections,
+                (
+                    f"Smoke detected in {sum(self._smoke_window)}/"
+                    f"{self.smoke_window_size} recent frames"
+                ),
             )
 
         # ── Cooldown check ──────────────────────────────────────────
@@ -134,4 +157,5 @@ class FireAlarmEngine:
         """Reset all counters (useful when switching sources)."""
         self._fire_frames = 0
         self._smoke_frames = 0
+        self._smoke_window = []
         self._last_alarm_time = 0.0
